@@ -1,0 +1,192 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.spatial import distance
+from sklearn.manifold import MDS
+from scipy import stats
+import os
+import argparse
+import warnings
+
+warnings.filterwarnings('ignore')
+
+# ==========================================
+# CONFIGURATION BLOCK
+# ==========================================
+CONFIG = {
+    "otu_file": "otu_table.csv",           # Rows: Samples, Cols: Taxa
+    "metadata_file": "metadata.csv",       # Rows: Samples, Cols: Clinical/Behavioral variables
+    "output_dir": "Microbiome_Results",
+    "target_variable": "Host_Species",     # E.g., 'Host_Species' or 'Behavior_Phenotype'
+    "secondary_variable": "Behavior_Phenotype",
+    "rarefaction_depth": 10000             # Minimum reads per sample (simulated here)
+}
+
+# ==========================================
+# ADVANCED STATISTICAL & ECOLOGICAL FUNCTIONS
+# ==========================================
+
+def calculate_shannon_entropy(row: pd.Series) -> float:
+    """
+    Calculates the Shannon Diversity Index (H) for a single sample.
+    Math: H = -sum(p_i * ln(p_i)), where p_i is the relative abundance of each taxon.
+    """
+    counts = row[row > 0]
+    if len(counts) == 0:
+        return 0.0
+    proportions = counts / counts.sum()
+    return -np.sum(proportions * np.log(proportions))
+
+def calculate_bray_curtis_matrix(otu_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Calculates the Bray-Curtis dissimilarity matrix between all pairs of samples.
+    Used for Beta Diversity assessment.
+    """
+    # Convert absolute counts to relative abundances for accurate beta diversity
+    relative_abundance = otu_df.div(otu_df.sum(axis=1), axis=0)
+    
+    dist_matrix = distance.cdist(relative_abundance, relative_abundance, metric='braycurtis')
+    return pd.DataFrame(dist_matrix, index=otu_df.index, columns=otu_df.index)
+
+def compute_pcoa(dist_matrix: pd.DataFrame) -> pd.DataFrame:
+    """
+    Performs Principal Coordinates Analysis (PCoA) using Metric Multidimensional Scaling (MDS).
+    """
+    # MDS with precomputed distances is mathematically equivalent to standard PCoA
+    mds = MDS(n_components=2, dissimilarity='precomputed', random_state=42, normalized_stress='auto')
+    coords = mds.fit_transform(dist_matrix)
+    
+    pcoa_df = pd.DataFrame(coords, index=dist_matrix.index, columns=['PCoA1', 'PCoA2'])
+    return pcoa_df
+
+# ==========================================
+# MAIN EXECUTION PIPELINE
+# ==========================================
+
+def generate_mock_microbiome_data() -> tuple:
+    """
+    Generates synthetic OTU counts and metadata to simulate an observational 
+    study comparing human and canine cohorts with different behavioral phenotypes.
+    """
+    print("[!] Input files not found. Generating mock 16S/Metagenomic cohort data...")
+    np.random.seed(42)
+    n_samples = 80
+    
+    # Generate Metadata
+    sample_ids = [f"Sample_{i:03d}" for i in range(1, n_samples + 1)]
+    species = np.random.choice(['Human', 'Canine'], n_samples)
+    
+    # Introduce a bias: Canines tend to be scored as 'Hyperactive' more often in this mock set
+    phenotype = []
+    for s in species:
+        if s == 'Canine':
+            phenotype.append(np.random.choice(['Calm', 'Hyperactive'], p=[0.4, 0.6]))
+        else:
+            phenotype.append(np.random.choice(['Calm', 'Anxious'], p=[0.7, 0.3]))
+            
+    meta_df = pd.DataFrame({
+        'Host_Species': species,
+        'Behavior_Phenotype': phenotype,
+        'Age_Months': np.random.randint(12, 120, n_samples)
+    }, index=sample_ids)
+    
+    # Generate OTU Table (100 taxa)
+    # Introduce structural differences between Humans and Canines
+    taxa_ids = [f"ASV_{i:03d}" for i in range(1, 101)]
+    otu_data = []
+    
+    for idx, row in meta_df.iterrows():
+        base_counts = np.random.poisson(lam=50, size=100)
+        # Shift microbiome composition based on host species
+        if row['Host_Species'] == 'Canine':
+            base_counts[0:20] += np.random.poisson(lam=150, size=20) # Firmicutes enriched
+        else:
+            base_counts[80:100] += np.random.poisson(lam=150, size=20) # Bacteroidetes enriched
+            
+        # Add random sequencing depth noise
+        depth_multiplier = np.random.uniform(0.8, 1.2)
+        otu_data.append((base_counts * depth_multiplier).astype(int))
+        
+    otu_df = pd.DataFrame(otu_data, index=sample_ids, columns=taxa_ids)
+    
+    return otu_df, meta_df
+
+def main(otu_path: str, meta_path: str):
+    print("[*] Initializing Microbiome Diversity Pipeline")
+    os.makedirs(CONFIG["output_dir"], exist_ok=True)
+    
+    # Load Data
+    try:
+        otu_df = pd.read_csv(otu_path, index_col=0)
+        meta_df = pd.read_csv(meta_path, index_col=0)
+        print(f"[*] Successfully loaded {len(otu_df)} samples.")
+    except FileNotFoundError:
+        otu_df, meta_df = generate_mock_microbiome_data()
+
+    # Align Dataframes (ensure same samples in both)
+    common_samples = otu_df.index.intersection(meta_df.index)
+    otu_df = otu_df.loc[common_samples]
+    meta_df = meta_df.loc[common_samples]
+
+    # --- ALPHA DIVERSITY ---
+    print("[*] Computing Alpha Diversity (Shannon Index)...")
+    meta_df['Shannon_Index'] = otu_df.apply(calculate_shannon_entropy, axis=1)
+    
+    # Statistics: Kruskal-Wallis H-test for Alpha Diversity
+    groups = [group['Shannon_Index'].values for name, group in meta_df.groupby(CONFIG['target_variable'])]
+    h_stat, p_val = stats.kruskal(*groups)
+    print(f"    -> Kruskal-Wallis p-value for {CONFIG['target_variable']}: {p_val:.4e}")
+
+    # Plot Alpha Diversity
+    plt.figure(figsize=(8, 6))
+    sns.set_style("whitegrid")
+    sns.boxplot(x=CONFIG['target_variable'], y='Shannon_Index', data=meta_df, hue=CONFIG['secondary_variable'], palette="Set2")
+    sns.stripplot(x=CONFIG['target_variable'], y='Shannon_Index', data=meta_df, color='black', alpha=0.5, dodge=True)
+    plt.title(f'Alpha Diversity (Shannon) by {CONFIG["target_variable"]}\nKruskal-Wallis p-value: {p_val:.4f}', fontweight='bold')
+    plt.ylabel('Shannon Entropy ($H$)')
+    plt.savefig(os.path.join(CONFIG["output_dir"], "Alpha_Diversity_Plot.png"), dpi=300, bbox_inches='tight')
+    plt.close()
+
+    # --- BETA DIVERSITY & PCoA ---
+    print("[*] Computing Beta Diversity (Bray-Curtis & PCoA)...")
+    dist_matrix = calculate_bray_curtis_matrix(otu_df)
+    pcoa_df = compute_pcoa(dist_matrix)
+    
+    # Merge PCoA coordinates with metadata for plotting
+    pcoa_meta = pcoa_df.join(meta_df)
+    
+    # Plot PCoA
+    plt.figure(figsize=(10, 8))
+    sns.scatterplot(
+        x='PCoA1', y='PCoA2', 
+        hue=CONFIG['target_variable'], 
+        style=CONFIG['secondary_variable'], 
+        data=pcoa_meta, 
+        s=100, alpha=0.8, palette="Dark2"
+    )
+    plt.title('Beta Diversity: PCoA (Bray-Curtis Dissimilarity)', fontsize=14, fontweight='bold', pad=15)
+    plt.xlabel('PCoA Axis 1')
+    plt.ylabel('PCoA Axis 2')
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', frameon=True)
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.savefig(os.path.join(CONFIG["output_dir"], "Beta_Diversity_PCoA_Plot.png"), dpi=300, bbox_inches='tight')
+    plt.close()
+
+    # Export merged analytical dataset
+    export_df = meta_df.copy()
+    export_df['PCoA1'] = pcoa_df['PCoA1']
+    export_df['PCoA2'] = pcoa_df['PCoA2']
+    export_path = os.path.join(CONFIG["output_dir"], "Integrated_Microbiome_Analysis.csv")
+    export_df.to_csv(export_path)
+
+    print(f"\n[+] Pipeline completed successfully.")
+    print(f"[+] All figures and statistical tables exported to: {CONFIG['output_dir']}")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Microbiome Alpha and Beta Diversity Pipeline")
+    parser.add_argument("--otu", type=str, default=CONFIG["otu_file"], help="Path to OTU/ASV table")
+    parser.add_argument("--meta", type=str, default=CONFIG["metadata_file"], help="Path to Metadata table")
+    args = parser.parse_args()
+    
+    main(args.otu, args.meta)
